@@ -2,7 +2,10 @@
 //
 // Streams responses back to the client. Retries transient HTTP errors (429, 500,
 // 502, 503, 504) and network errors before a response body is streamed to the
-// client. Uses capped linear backoff + jitter (not slow exponential backoff).
+// client. Retries aggressively with a uniform random jitter in [minDelayMs,
+// maxDelayMs] (NOT slow exponential backoff) and a very high attempt ceiling,
+// so the proxy keeps trying through provider-side rate-limit / availability
+// windows until it succeeds (or hits the ceiling).
 //
 // IMPORTANT RETRY LIMITATION:
 // The proxy can only retry BEFORE a response is streamed to Claude Code. Once the
@@ -65,12 +68,15 @@ Config fields:
   listenHost          Host to bind (default 127.0.0.1)
   port                Port to listen on (required, 1-65535)
   upstreamBaseUrl     Upstream provider base URL (required)
-  maxAttempts         Total attempts including the first (>=1)
-  baseDelayMs         Base delay for backoff
-  maxDelayMs          Cap for backoff delay
+  maxAttempts         Total attempts including the first (>=1). Use a very high
+                      value (e.g. 500000) to retry almost indefinitely.
+  minDelayMs          Minimum retry delay (jitter range low end)
+  maxDelayMs          Maximum retry delay (jitter range high end)
   retryStatuses       HTTP statuses that trigger a retry
   requestTimeoutMs    Per-attempt upstream request timeout
   logLevel            "debug" | "info" | "warn" | "error"
+  logProgressEveryAttempts  Emit a progress log every N attempts (default 1000)
+  logProgressIntervalMs     Emit a progress log at most every N ms (default 10000)
 `);
 }
 
@@ -119,6 +125,20 @@ function validateConfig(cfg) {
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
     errors.push(`maxAttempts must be an integer >= 1, got ${JSON.stringify(cfg.maxAttempts)}.`);
   }
+  // min/max delay define the random jitter range for retries (inclusive).
+  // Backwards compat: if only legacy baseDelayMs/maxDelayMs are present, we
+  // still accept them (base -> min, max -> max), but minDelayMs/maxDelayMs win.
+  const minDelay = Number(cfg.minDelayMs ?? cfg.baseDelayMs ?? 1);
+  const maxDelay = Number(cfg.maxDelayMs ?? cfg.maxDelayMs ?? 20);
+  if (!Number.isFinite(minDelay) || minDelay < 0) {
+    errors.push(`minDelayMs must be a number >= 0, got ${JSON.stringify(cfg.minDelayMs ?? cfg.baseDelayMs)}.`);
+  }
+  if (!Number.isFinite(maxDelay) || maxDelay < 0) {
+    errors.push(`maxDelayMs must be a number >= 0, got ${JSON.stringify(cfg.maxDelayMs)}.`);
+  }
+  if (maxDelay < minDelay) {
+    errors.push(`maxDelayMs (${maxDelay}) must be >= minDelayMs (${minDelay}).`);
+  }
   const port = Number(cfg.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     errors.push(`port must be an integer in [1, 65535], got ${JSON.stringify(cfg.port)}.`);
@@ -131,18 +151,25 @@ function validateConfig(cfg) {
 }
 
 function normalizeConfig(cfg) {
+  const minDelay = Number(cfg.minDelayMs ?? cfg.baseDelayMs ?? 1);
+  const maxDelay = Number(cfg.maxDelayMs ?? 20);
   return {
     listenHost: cfg.listenHost ?? '127.0.0.1',
     port: Number(cfg.port),
     upstreamBaseUrl: cfg.upstreamBaseUrl.replace(/\/+$/, ''), // strip trailing slashes
     maxAttempts: Number(cfg.maxAttempts),
-    baseDelayMs: Number(cfg.baseDelayMs ?? 1000),
-    maxDelayMs: Number(cfg.maxDelayMs ?? 30000),
+    minDelayMs: minDelay,
+    maxDelayMs: maxDelay,
+    // Backwards-compat alias for old configs that used baseDelayMs.
+    baseDelayMs: minDelay,
     retryStatuses: Array.isArray(cfg.retryStatuses)
       ? cfg.retryStatuses.map((s) => Number(s))
       : [429, 500, 502, 503, 504],
     requestTimeoutMs: Number(cfg.requestTimeoutMs ?? 600000),
     logLevel: cfg.logLevel ?? 'info',
+    // How often (ms) to emit a progress line while a request is stuck retrying.
+    logProgressIntervalMs: Number(cfg.logProgressIntervalMs ?? 10000),
+    logProgressEveryAttempts: Number(cfg.logProgressEveryAttempts ?? 1000),
   };
 }
 
@@ -195,15 +222,21 @@ function redactHeaders(headers) {
 // Backoff
 // ---------------------------------------------------------------------------
 
-// Capped linear backoff + jitter: delay grows linearly from baseDelayMs up to
-// maxDelayMs, then is randomized with +/- 25% jitter. Not exponential.
-function backoffDelay(attempt, baseDelayMs, maxDelayMs) {
-  // attempt is 0-indexed for the retry that just failed (0 = first failure).
-  const linear = baseDelayMs * (attempt + 1);
-  const capped = Math.min(linear, maxDelayMs);
-  // jitter in [-25%, +25%] of capped delay. Math.random is fine here (not crypto).
-  const jitter = capped * 0.25 * (Math.random() * 2 - 1);
-  return Math.max(0, Math.round(capped + jitter));
+// Retry delay is a uniform random jitter in [minDelayMs, maxDelayMs].
+// We deliberately do NOT use slow exponential backoff: with a known upstream
+// rate-limit/availability pattern, the goal is to retry aggressively but with
+// randomized timing to avoid synchronized thundering-herd effects across many
+// concurrent in-flight requests.
+//
+// `attempt` is accepted for API compatibility but not used — the delay range is
+// constant across attempts, only the random value differs.
+function backoffDelay(attempt, minDelayMs, maxDelayMs) {
+  void attempt;
+  if (maxDelayMs <= 0) return 0;
+  const lo = Math.max(0, minDelayMs);
+  const hi = Math.max(lo, maxDelayMs);
+  // inclusive random in [lo, hi]
+  return Math.round(lo + Math.random() * (hi - lo));
 }
 
 function sleep(ms) {
@@ -377,17 +410,29 @@ async function handleProxy(req, res, cfg, logger) {
   let lastStatus = 0;
   let lastError = null;
 
+  // Sparse progress logging: when a request is stuck retrying for a long time
+  // (which is the whole point of maxAttempts=500000), we must NOT log every
+  // attempt — that would write gigabytes of logs and saturate disk I/O. We emit
+  // a progress line at most every logProgressEveryAttempts attempts AND at most
+  // every logProgressIntervalMs wall-clock ms, whichever comes first.
+  let lastProgressAttempt = 0;
+  let lastProgressTime = Date.now();
+
   for (let attempt = 0; attempt < cfg.maxAttempts; attempt++) {
     const targetUrl = buildTargetUrl(cfg.upstreamBaseUrl, pathOnly, query);
 
-    logger.info('upstream request', {
-      attempt: attempt + 1,
-      of: cfg.maxAttempts,
-      method,
-      url: targetUrl,
-      // redact sensitive headers in logs
-      headers: redactHeaders(forwardHeaders),
-    });
+    // Only log the full per-attempt request line on the first attempt; for
+    // retries we rely on the sparse progress logger below to avoid log storms.
+    if (attempt === 0) {
+      logger.info('upstream request', {
+        attempt: 1,
+        of: cfg.maxAttempts,
+        method,
+        url: targetUrl,
+        // redact sensitive headers in logs
+        headers: redactHeaders(forwardHeaders),
+      });
+    }
 
     const result = await makeUpstreamRequest({
       method,
@@ -401,10 +446,6 @@ async function handleProxy(req, res, cfg, logger) {
       // Network / request error -> retryable.
       lastStatus = 0;
       lastError = result.error;
-      logger.warn('upstream request error (retryable)', {
-        attempt: attempt + 1,
-        error: result.error.message,
-      });
     } else {
       const upstreamRes = result.res;
       lastStatus = upstreamRes.statusCode || 0;
@@ -415,6 +456,13 @@ async function handleProxy(req, res, cfg, logger) {
       if (!isRetryable) {
         // Success (or non-retryable error): stream the response back to client.
         // We are now committed — no more retries.
+        if (attempt > 0) {
+          logger.info('upstream success after retries', {
+            attempt: attempt + 1,
+            status: lastStatus,
+            path: incomingPath,
+          });
+        }
         streamResponse(res, upstreamRes, logger);
         return;
       }
@@ -422,37 +470,46 @@ async function handleProxy(req, res, cfg, logger) {
       // Retryable status. Consume + discard the body so the socket can be reused
       // and we can retry cleanly. We have NOT written anything to the client yet.
       await drainResponse(upstreamRes);
-
-      const retryAfterMs = parseRetryAfter(upstreamRes.headers['retry-after'], Date.now());
-      logger.warn('retryable upstream status', {
-        attempt: attempt + 1,
-        status: lastStatus,
-        retryAfterMs,
-        headers: redactHeaders(upstreamRes.headers),
-      });
-
-      if (attempt + 1 >= cfg.maxAttempts) {
-        break;
-      }
-
-      // Backoff: respect Retry-After if present, else capped linear + jitter.
-      const delay =
-        retryAfterMs != null
-          ? Math.min(retryAfterMs, cfg.maxDelayMs * 4) // cap Retry-After to avoid extreme waits
-          : backoffDelay(attempt, cfg.baseDelayMs, cfg.maxDelayMs);
-
-      if (delay > 0) {
-        logger.debug('backoff before retry', { delayMs: delay });
-        await sleep(delay);
-      }
-      continue;
     }
 
-    // Network error path: backoff and retry if attempts remain.
-    if (attempt + 1 >= cfg.maxAttempts) break;
-    const delay = backoffDelay(attempt, cfg.baseDelayMs, cfg.maxDelayMs);
+    // ---- Retryable outcome (network error OR retryable status) ----
+    const retryAfterMs =
+      result.ok && result.res.headers['retry-after']
+        ? parseRetryAfter(result.res.headers['retry-after'], Date.now())
+        : null;
+
+    if (attempt + 1 >= cfg.maxAttempts) {
+      break;
+    }
+
+    // Sparse progress log. Emit on the first retry, then throttled by both
+    // attempt-count and wall-clock-time thresholds (whichever triggers first).
+    const now = Date.now();
+    const byCount = attempt - lastProgressAttempt >= cfg.logProgressEveryAttempts;
+    const byTime = now - lastProgressTime >= cfg.logProgressIntervalMs;
+    if (attempt === 0 || byCount || byTime) {
+      logger.warn('retrying upstream', {
+        attempt: attempt + 1,
+        of: cfg.maxAttempts,
+        method,
+        path: incomingPath,
+        lastStatus,
+        lastError: lastError?.message ?? null,
+        retryAfterMs,
+      });
+      lastProgressAttempt = attempt;
+      lastProgressTime = now;
+    }
+
+    // Delay: respect Retry-After if the upstream gave one (capped so a hostile
+    // Retry-After can't stall us forever); otherwise a uniform random jitter in
+    // [minDelayMs, maxDelayMs].
+    const delay =
+      retryAfterMs != null
+        ? Math.min(retryAfterMs, Math.max(cfg.maxDelayMs, 1000) * 4)
+        : backoffDelay(attempt, cfg.minDelayMs, cfg.maxDelayMs);
+
     if (delay > 0) {
-      logger.debug('backoff before retry', { delayMs: delay });
       await sleep(delay);
     }
   }

@@ -2,10 +2,12 @@
   "listenHost": "127.0.0.1",
   "port": 8787,
   "upstreamBaseUrl": "https://provider.example.com/anthropic",
-  "maxAttempts": 15,
-  "baseDelayMs": 2000,
-  "maxDelayMs": 15000,
+  "maxAttempts": 500000,
+  "minDelayMs": 1,
+  "maxDelayMs": 20,
   "retryStatuses": [429, 500, 502, 503, 504],
   "requestTimeoutMs": 1800000,
-  "logLevel": "info"
+  "logLevel": "info",
+  "logProgressEveryAttempts": 1000,
+  "logProgressIntervalMs": 10000
 }
