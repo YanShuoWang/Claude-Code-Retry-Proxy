@@ -1,5 +1,11 @@
 # claude-retry-proxy
 
+![Node.js Version](https://img.shields.io/badge/Node.js-%3E%3D18-339933?logo=node.js&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-blue)
+![Dependencies](https://img.shields.io/badge/dependencies-zero-success)
+
+[中文文档](README_ZH.md)
+
 A small local HTTP **retry proxy** for Claude Code-compatible API providers.
 
 When using coding agents with third-party API providers, especially providers that offer coding-plan or coding-agent model access, upstream capacity can be unstable. During busy periods, providers may frequently return transient errors such as **503 Service Unavailable** or **429 Too Many Requests**, which can interrupt long-running coding tasks.
