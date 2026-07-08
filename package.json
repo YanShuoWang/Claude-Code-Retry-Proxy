@@ -1,0 +1,14 @@
+{
+  "name": "claude-retry-proxy",
+  "version": "1.0.0",
+  "description": "Local HTTP retry proxy for Claude Code-compatible API providers. Forwards requests upstream and retries transient errors (429, 500, 502, 503, 504) before streaming the response back.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/index.mjs --config ./config.local.json",
+    "start:example": "node src/index.mjs --config ./config.example.json"
+  },
+  "license": "MIT"
+}
